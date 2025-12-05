@@ -43,7 +43,7 @@ class BaseModelNetwork(nn.Module):
             self.value_mean_std = RunningMeanStd((self.value_size,)) #   GeneralizedMovingStats((self.value_size,)) #   
         if normalize_input:
             if isinstance(obs_shape, dict):
-                self.running_mean_std = RunningMeanStdObs(obs_shape)
+                self.running_mean_std = RunningMeanStdObs(obs_shape, ignore_keys=['semantic_segmentation'])
             else:
                 self.running_mean_std = RunningMeanStd(obs_shape)
 
