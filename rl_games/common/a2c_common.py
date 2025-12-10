@@ -1188,6 +1188,7 @@ class ContinuousA2CBase(A2CBase):
         self.set_train()
         self.curr_frames = batch_dict.pop('played_frames')
         self.prepare_dataset(batch_dict)
+        self.algo_observer.update_buffer(self.experience_buffer)
         self.algo_observer.after_steps()
         if self.has_central_value:
             self.train_central_value()
