@@ -374,6 +374,13 @@ class A2CBase(BaseAlgorithm):
 
     def set_eval(self):
         self.model.eval()
+        
+        # Reset feature extractor history at start of each rollout
+        if hasattr(self.model, 'a2c_network') and hasattr(self.model.a2c_network, 'feature_extractor'):
+            fe = self.model.a2c_network.feature_extractor
+            if hasattr(fe, 'reset_history'):
+                fe.reset_history()
+        
         if self.normalize_rms_advantage:
             self.advantage_mean_std.eval()
 
