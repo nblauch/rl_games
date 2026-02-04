@@ -1098,9 +1098,14 @@ class DiscreteA2CBase(A2CBase):
                     # removed equal signs (i.e. "rew=") from the checkpoint name since it messes with hydra CLI parsing
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
+                    # Save checkpoint with fixed name for wandb upload (overwrites previous)
+                    latest_checkpoint_path = os.path.join(self.nn_dir, 'latest_' + self.config['name'])
+
                     if self.save_freq > 0:
                         if epoch_num % self.save_freq == 0:
-                            self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+                            print('saving most recent model')
+                            self.save(latest_checkpoint_path)
+                            self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print('saving next best rewards: ', mean_rewards)
@@ -1110,7 +1115,6 @@ class DiscreteA2CBase(A2CBase):
                         if 'score_to_win' in self.config:
                             if self.last_mean_rewards > self.config['score_to_win']:
                                 print('Maximum reward achieved. Network won!')
-                                self.save(os.path.join(self.nn_dir, checkpoint_name))
                                 should_exit = True
 
                 if epoch_num >= self.max_epochs and self.max_epochs != -1:
@@ -1118,8 +1122,8 @@ class DiscreteA2CBase(A2CBase):
                         print('WARNING: Max epochs reached before any env terminated at least once')
                         mean_rewards = -np.inf
 
-                    self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_ep_' + str(epoch_num) \
-                        + '_rew_' + str(mean_rewards).replace('[', '_').replace(']', '_')))
+                    self.save(latest_checkpoint_path)
+                    self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
                     print('MAX EPOCHS NUM!')
                     should_exit = True
 
@@ -1128,8 +1132,8 @@ class DiscreteA2CBase(A2CBase):
                         print('WARNING: Max frames reached before any env terminated at least once')
                         mean_rewards = -np.inf
 
-                    self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_frame_' + str(self.frame) \
-                        + '_rew_' + str(mean_rewards).replace('[', '_').replace(']', '_')))
+                    self.save(latest_checkpoint_path)
+                    self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
                     print('MAX FRAMES NUM!')
                     should_exit = True
 
@@ -1376,9 +1380,14 @@ class ContinuousA2CBase(A2CBase):
 
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
+                    # Save checkpoint with fixed name for wandb upload (overwrites previous)
+                    latest_checkpoint_path = os.path.join(self.nn_dir, 'latest_' + self.config['name'])
+
                     if self.save_freq > 0:
                         if epoch_num % self.save_freq == 0:
-                            self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+                            print('saving most recent model')
+                            self.save(latest_checkpoint_path)
+                            self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print('saving next best rewards: ', mean_rewards)
@@ -1388,7 +1397,6 @@ class ContinuousA2CBase(A2CBase):
                         if 'score_to_win' in self.config:
                             if self.last_mean_rewards > self.config['score_to_win']:
                                 print('Maximum reward achieved. Network won!')
-                                self.save(os.path.join(self.nn_dir, checkpoint_name))
                                 should_exit = True
 
                 if epoch_num >= self.max_epochs and self.max_epochs != -1:
@@ -1396,8 +1404,8 @@ class ContinuousA2CBase(A2CBase):
                         print('WARNING: Max epochs reached before any env terminated at least once')
                         mean_rewards = -np.inf
 
-                    self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_ep_' + str(epoch_num) \
-                        + '_rew_' + str(mean_rewards).replace('[', '_').replace(']', '_')))
+                    self.save(latest_checkpoint_path)
+                    self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
                     print('MAX EPOCHS NUM!')
                     should_exit = True
 
@@ -1406,8 +1414,8 @@ class ContinuousA2CBase(A2CBase):
                         print('WARNING: Max frames reached before any env terminated at least once')
                         mean_rewards = -np.inf
 
-                    self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_frame_' + str(self.frame) \
-                        + '_rew_' + str(mean_rewards).replace('[', '_').replace(']', '_')))
+                    self.save(latest_checkpoint_path)
+                    self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
                     print('MAX FRAMES NUM!')
                     should_exit = True
 
