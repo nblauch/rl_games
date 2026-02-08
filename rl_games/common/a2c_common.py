@@ -455,7 +455,96 @@ class A2CBase(BaseAlgorithm):
     def reset_envs(self):
         self.obs = self.env_reset()
 
+    def _setup_vision_caching(self):
+        """Configure vision feature/crop caching based on network config flags.
+
+        Modifies self.env_info['observation_space'] to replace image keys with
+        cached representations, so the experience buffer allocates smaller tensors.
+
+        Config flags (on the a2c_network config):
+            cache_encoder_features: bool  -- cache backbone features; requires frozen backbone
+            cache_retinal_features: bool  -- cache retinal output (foveated crops)
+        """
+        self.cache_encoder_features = False
+        self.cache_retinal_features = False
+
+        if not hasattr(self.model, 'a2c_network'):
+            return
+        net = self.model.a2c_network
+        if not hasattr(net, 'feature_extractor'):
+            return
+
+        cfg = getattr(net, 'cfg', None)
+        if cfg is None:
+            return
+
+        cache_features = cfg.get('cache_encoder_features', False)
+        cache_crops = cfg.get('cache_retinal_features', False)
+
+        if not cache_features and not cache_crops:
+            return
+
+        obs_space = self.env_info.get('observation_space')
+        if not isinstance(obs_space, gym.spaces.Dict):
+            return
+
+        image_keys = net.image_obs_keys
+
+        # Build new observation space without image keys
+        new_spaces = {k: v for k, v in obs_space.spaces.items() if k not in image_keys}
+
+        if cache_features:
+            # Level 2: store backbone features (pos_emb already applied)
+            num_features = net._vision_num_features
+            new_spaces['encoder_features'] = gym.spaces.Box(
+                low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32
+            )
+            self.cache_encoder_features = True
+            print(f"[Vision Caching] Caching encoder features (dim={num_features}) instead of images")
+        elif cache_crops:
+            # Level 1: store foveated crops + fixation coordinates
+            # Probe the feature extractor for crop shape
+            fe = net.feature_extractor
+            n_channels = fe.get_in_channels()
+            if net.is_stereo:
+                n_channels *= 2
+            # N is determined by the retinal transform sampling grid (not exactly resize_size^2)
+            crop_n = len(fe.retinal_transform.sampler.coords)
+            new_spaces['retinal_features'] = gym.spaces.Box(
+                low=-np.inf, high=np.inf, shape=(n_channels, crop_n), dtype=np.float32
+            )
+            new_spaces['fixations'] = gym.spaces.Box(
+                low=-1.0, high=1.0, shape=(2,), dtype=np.float32
+            )
+            self.cache_retinal_features = True
+            print(f"[Vision Caching] Caching retinal features (shape=({n_channels}, {crop_n})) instead of images")
+
+        self.env_info['observation_space'] = gym.spaces.Dict(new_spaces)
+
+    def _get_obs_to_store(self):
+        """Return the observation dict to store in the experience buffer.
+
+        When vision caching is enabled, replaces image keys with cached
+        features or foveated crops from the last forward pass.
+        """
+        if self.cache_encoder_features:
+            net = self.model.a2c_network
+            return {
+                'proprio': self.obs['obs']['proprio'],
+                'encoder_features': net._last_vision_features,
+            }
+        elif self.cache_retinal_features:
+            net = self.model.a2c_network
+            return {
+                'proprio': self.obs['obs']['proprio'],
+                'retinal_features': net._last_foveated_crops,
+                'fixations': net._last_fixations,
+            }
+        else:
+            return self.obs['obs']
+
     def init_tensors(self):
+        self._setup_vision_caching()
         batch_size = self.num_agents * self.num_actors
         algo_info = {
             'num_actors' : self.num_actors,
@@ -747,7 +836,7 @@ class A2CBase(BaseAlgorithm):
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
                 res_dict = self.get_action_values(self.obs)
-            self.experience_buffer.update_data('obses', n, self.obs['obs'])
+            self.experience_buffer.update_data('obses', n, self._get_obs_to_store())
             self.experience_buffer.update_data('dones', n, self.dones)
 
             for k in update_list:
@@ -820,7 +909,7 @@ class A2CBase(BaseAlgorithm):
                 res_dict = self.get_action_values(self.obs)
 
             self.rnn_states = res_dict['rnn_states']
-            self.experience_buffer.update_data('obses', n, self.obs['obs'])
+            self.experience_buffer.update_data('obses', n, self._get_obs_to_store())
             self.experience_buffer.update_data('dones', n, self.dones.byte())
 
             for k in update_list:

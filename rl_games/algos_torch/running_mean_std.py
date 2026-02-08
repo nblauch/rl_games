@@ -90,5 +90,10 @@ class RunningMeanStdObs(nn.Module):
         })
     
     def forward(self, input, denorm=False):
-        res = {k : self.running_mean_std[k](v, denorm) if k not in self.ignore_keys else v for k,v in input.items()}
+        res = {}
+        for k, v in input.items():
+            if k in self.ignore_keys or k not in self.running_mean_std:
+                res[k] = v
+            else:
+                res[k] = self.running_mean_std[k](v, denorm)
         return res
