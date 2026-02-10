@@ -500,6 +500,13 @@ class A2CBase(BaseAlgorithm):
             new_spaces['encoder_features'] = gym.spaces.Box(
                 low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32
             )
+            # Also cache raw hook activations when hook features are enabled
+            if getattr(net, '_use_hook_features', False):
+                raw_dim = sum(n * d for n, d in net._hook_layer_shapes.values())
+                new_spaces['token_features'] = gym.spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(raw_dim,), dtype=np.float32
+                )
+                print(f"[Vision Caching] Also caching raw token features (dim={raw_dim})")
             self.cache_encoder_features = True
             print(f"[Vision Caching] Caching encoder features (dim={num_features}) instead of images")
         elif cache_crops:
@@ -530,10 +537,13 @@ class A2CBase(BaseAlgorithm):
         """
         if self.cache_encoder_features:
             net = self.model.a2c_network
-            return {
+            result = {
                 'proprio': self.obs['obs']['proprio'],
                 'encoder_features': net._last_vision_features,
             }
+            if getattr(net, '_use_hook_features', False):
+                result['token_features'] = net._last_token_features
+            return result
         elif self.cache_retinal_features:
             net = self.model.a2c_network
             return {
