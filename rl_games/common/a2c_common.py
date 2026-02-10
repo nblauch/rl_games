@@ -543,6 +543,9 @@ class A2CBase(BaseAlgorithm):
             }
             if getattr(net, '_use_hook_features', False):
                 result['token_features'] = net._last_token_features
+            # Preserve fixations for downstream use
+            if 'fixations' in self.obs['obs']:
+                result['fixations'] = self.obs['obs']['fixations']
             return result
         elif self.cache_retinal_features:
             net = self.model.a2c_network
