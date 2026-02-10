@@ -487,6 +487,14 @@ class A2CBase(BaseAlgorithm):
         new_spaces = {k: v for k, v in obs_space.spaces.items() if k not in image_keys}
 
         if cache_features:
+            # Sanity check: caching encoder features is only valid for a frozen backbone
+            trainable = [n for n, p in net.feature_extractor.named_parameters() if p.requires_grad]
+            if trainable:
+                raise RuntimeError(
+                    f"cache_encoder_features=True but feature_extractor has {len(trainable)} "
+                    f"trainable parameters (first 5: {trainable[:5]}). "
+                    "Caching is only valid when the backbone is fully frozen."
+                )
             # Level 2: store backbone features (pos_emb already applied)
             num_features = net._vision_num_features
             new_spaces['encoder_features'] = gym.spaces.Box(
