@@ -27,12 +27,17 @@ class BaseModel():
         obs_shape = config['input_shape']
         normalize_value = config.get('normalize_value', False)
         normalize_input = config.get('normalize_input', False)
+        # Read normalize_keys from build config, falling back to network config, then default
+        net_params = getattr(self.network_builder, 'params', {})
+        normalize_keys = config.get('normalize_keys',
+                                    net_params.get('normalize_keys', ['proprio']))
         value_size = config.get('value_size', 1)
         return self.Network(self.network_builder.build(self.model_class, **config), obs_shape=obs_shape,
-            normalize_value=normalize_value, normalize_input=normalize_input, value_size=value_size)
+            normalize_value=normalize_value, normalize_input=normalize_input, value_size=value_size,
+            normalize_keys=normalize_keys)
 
 class BaseModelNetwork(nn.Module):
-    def __init__(self, obs_shape, normalize_value, normalize_input, value_size):
+    def __init__(self, obs_shape, normalize_value, normalize_input, value_size, normalize_keys=None):
         nn.Module.__init__(self)
         self.obs_shape = obs_shape
         self.normalize_value = normalize_value
@@ -40,12 +45,12 @@ class BaseModelNetwork(nn.Module):
         self.value_size = value_size
 
         if normalize_value:
-            self.value_mean_std = RunningMeanStd((self.value_size,)) #   GeneralizedMovingStats((self.value_size,)) #   
+            self.value_mean_std = RunningMeanStd((self.value_size,), name='value_mean_std')
         if normalize_input:
             if isinstance(obs_shape, dict):
-                self.running_mean_std = RunningMeanStdObs(obs_shape, ignore_keys=['semantic_segmentation', 'depth'])
+                self.running_mean_std = RunningMeanStdObs(obs_shape, normalize_keys=normalize_keys)
             else:
-                self.running_mean_std = RunningMeanStd(obs_shape)
+                self.running_mean_std = RunningMeanStd(obs_shape, name='running_mean_std')
 
     def norm_obs(self, observation):
         with torch.no_grad():
