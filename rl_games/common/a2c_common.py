@@ -1175,6 +1175,8 @@ class DiscreteA2CBase(A2CBase):
 
                 self.algo_observer.after_print_stats(frame, epoch_num, total_time)
 
+                latest_checkpoint_path = os.path.join(self.nn_dir, 'latest_' + self.config['name'])
+
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self.game_rewards.get_mean()
                     mean_shaped_rewards = self.game_shaped_rewards.get_mean()
@@ -1202,8 +1204,6 @@ class DiscreteA2CBase(A2CBase):
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
                     # Save checkpoint with fixed name for wandb upload (overwrites previous)
-                    latest_checkpoint_path = os.path.join(self.nn_dir, 'latest_' + self.config['name'])
-
                     if self.save_freq > 0:
                         if epoch_num % self.save_freq == 0:
                             print('saving most recent model')
@@ -1459,6 +1459,8 @@ class ContinuousA2CBase(A2CBase):
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
 
+                latest_checkpoint_path = os.path.join(self.nn_dir, 'latest_' + self.config['name'])
+
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self.game_rewards.get_mean()
                     mean_shaped_rewards = self.game_shaped_rewards.get_mean()
@@ -1484,8 +1486,6 @@ class ContinuousA2CBase(A2CBase):
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
                     # Save checkpoint with fixed name for wandb upload (overwrites previous)
-                    latest_checkpoint_path = os.path.join(self.nn_dir, 'latest_' + self.config['name'])
-
                     if self.save_freq > 0:
                         if epoch_num % self.save_freq == 0:
                             print('saving most recent model')
