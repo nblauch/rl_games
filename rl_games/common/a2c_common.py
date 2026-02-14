@@ -908,6 +908,16 @@ class A2CBase(BaseAlgorithm):
         mb_rnn_states = self.mb_rnn_states
         step_time = 0.0
 
+        # Seq-JEPA online intrinsic reward state
+        _seqjepa_online = getattr(self, 'seqjepa_enabled', False) and getattr(self, 'seqjepa_rew_lambda', 0.0) > 0
+        _seqjepa_prev_pred = None
+        _seqjepa_prev_dones = None
+        _seqjepa_net = None
+        if _seqjepa_online and hasattr(self.model, 'a2c_network'):
+            _seqjepa_net = self.model.a2c_network
+        elif _seqjepa_online and hasattr(self.model, 'module') and hasattr(self.model.module, 'a2c_network'):
+            _seqjepa_net = self.model.module.a2c_network
+
         for n in range(self.horizon_length):
             if n % self.seq_length == 0:
                 for s, mb_s in zip(self.rnn_states, mb_rnn_states):
@@ -931,6 +941,15 @@ class A2CBase(BaseAlgorithm):
             if self.has_central_value:
                 self.experience_buffer.update_data('states', n, self.obs['states'])
 
+            # Seq-JEPA: compute intrinsic reward from previous prediction vs current repr
+            seqjepa_intrinsic = None
+            if _seqjepa_online and _seqjepa_net is not None:
+                current_repr = getattr(_seqjepa_net, '_last_seqjepa_repr', None)
+                if _seqjepa_prev_pred is not None and current_repr is not None:
+                    seqjepa_intrinsic = _seqjepa_net.compute_seqjepa_intrinsic_reward(
+                        _seqjepa_prev_pred, current_repr, _seqjepa_prev_dones
+                    )
+
             step_time_start = time.time()
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
             step_time_end = time.time()
@@ -941,6 +960,15 @@ class A2CBase(BaseAlgorithm):
 
             if self.value_bootstrap and 'time_outs' in infos:
                 shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
+
+            # Add seq-JEPA intrinsic reward
+            if seqjepa_intrinsic is not None:
+                shaped_rewards = shaped_rewards + self.seqjepa_rew_lambda * seqjepa_intrinsic
+
+            # Seq-JEPA: compute prediction for this step (using sampled action)
+            if _seqjepa_online and _seqjepa_net is not None:
+                _seqjepa_prev_pred = _seqjepa_net.compute_seqjepa_prediction(res_dict['actions'])
+                _seqjepa_prev_dones = self.dones
 
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
 
@@ -1263,6 +1291,14 @@ class ContinuousA2CBase(A2CBase):
 
         self.clip_actions = self.config.get('clip_actions', True)
 
+        network_params = params.get('network', {})
+        integration_cfg = network_params.get('integration', {}) if isinstance(network_params, dict) else {}
+        seqjepa_cfg = integration_cfg.get('seqjepa_aux', {}) if isinstance(integration_cfg, dict) else {}
+        self.seqjepa_enabled = seqjepa_cfg.get('enabled', False)
+        self.seqjepa_aux_lambda = seqjepa_cfg.get('aux_lambda', 0.0)
+        self.seqjepa_rew_lambda = seqjepa_cfg.get('rew_lambda', 0.0)
+        self.seqjepa_ema_tau = seqjepa_cfg.get('ema_tau', 0.99)
+
         # todo introduce device instead of cuda()
         self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
         self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
@@ -1310,19 +1346,23 @@ class ContinuousA2CBase(A2CBase):
         a_losses = []
         c_losses = []
         b_losses = []
+        seqjepa_losses = []
         entropies = []
         kls = []
 
         for mini_ep in range(0, self.mini_epochs_num):
             ep_kls = []
             for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
+                train_result = self.train_actor_critic(self.dataset[i])
+                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = train_result[:9]
                 a_losses.append(a_loss)
                 c_losses.append(c_loss)
                 ep_kls.append(kl)
                 entropies.append(entropy)
                 if self.bounds_loss_coef is not None:
                     b_losses.append(b_loss)
+                if len(train_result) > 9:
+                    seqjepa_losses.append(train_result[9])
 
                 self.dataset.update_mu_sigma(cmu, csigma)
                 if self.schedule_type == 'legacy':
@@ -1351,7 +1391,7 @@ class ContinuousA2CBase(A2CBase):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, seqjepa_losses
 
     def prepare_dataset(self, batch_dict):
         obses = batch_dict['obses']
@@ -1430,7 +1470,7 @@ class ContinuousA2CBase(A2CBase):
 
         while True:
             epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
+            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, seqjepa_losses = self.train_epoch()
             total_time += sum_time
             frame = self.frame // self.num_agents
 
@@ -1455,6 +1495,8 @@ class ContinuousA2CBase(A2CBase):
 
                 if len(b_losses) > 0:
                     self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
+                if len(seqjepa_losses) > 0:
+                    self.writer.add_scalar('losses/seqjepa_aux_loss', torch_ext.mean_list(seqjepa_losses).item(), frame)
 
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)

@@ -101,7 +101,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             batch_dict['seq_length'] = self.seq_length
 
             if self.zero_rnn_on_done:
-                batch_dict['dones'] = input_dict['dones']            
+                batch_dict['dones'] = input_dict['dones']
 
         with torch.cuda.amp.autocast(enabled=self.mixed_precision):
             res_dict = self.model(batch_dict)
@@ -127,7 +127,12 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
 
             loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
-            
+            seqjepa_loss = torch.zeros(1, device=self.ppo_device)
+            if getattr(self, 'seqjepa_enabled', False) and 'seqjepa_aux_loss' in res_dict:
+                seqjepa_loss = res_dict['seqjepa_aux_loss']
+                if getattr(self, 'seqjepa_aux_lambda', 0.0) != 0:
+                    loss = loss + self.seqjepa_aux_lambda * seqjepa_loss
+
             if self.multi_gpu:
                 self.optimizer.zero_grad()
             else:
@@ -137,6 +142,9 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.scaler.scale(loss).backward()
         #TODO: Refactor this ugliest code of they year
         self.trancate_gradients_and_step()
+        if getattr(self, 'seqjepa_enabled', False) and hasattr(self.model, 'a2c_network') and hasattr(self.model.a2c_network, 'update_target_encoder'):
+            tau = getattr(self, 'seqjepa_ema_tau', 0.99)
+            self.model.a2c_network.update_target_encoder(tau)
 
         with torch.no_grad():
             reduce_kl = rnn_masks is None
@@ -155,7 +163,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
         self.train_result = (a_loss, c_loss, entropy, \
             kl_dist, self.last_lr, lr_mul, \
-            mu.detach(), sigma.detach(), b_loss)
+            mu.detach(), sigma.detach(), b_loss, seqjepa_loss)
 
     def train_actor_critic(self, input_dict):
         self.calc_gradients(input_dict)
