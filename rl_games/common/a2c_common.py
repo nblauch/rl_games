@@ -394,12 +394,12 @@ class A2CBase(BaseAlgorithm):
         #if self.has_central_value:
         #    self.central_value_net.update_lr(lr)
 
-    def get_action_values(self, obs):
+    def get_action_values(self, obs, prev_actions=None):
         processed_obs = self._preproc_obs(obs['obs'])
         self.model.eval()
         input_dict = {
             'is_train': False,
-            'prev_actions': None, 
+            'prev_actions': prev_actions, 
             'obs' : processed_obs,
             'rnn_states' : self.rnn_states
         }
@@ -918,6 +918,9 @@ class A2CBase(BaseAlgorithm):
         elif _seqjepa_online and hasattr(self.model, 'module') and hasattr(self.model.module, 'a2c_network'):
             _seqjepa_net = self.model.module.a2c_network
 
+        # Track previous action for concat_actions pos emb (action that led to current state)
+        _prev_action = getattr(self, '_rollout_prev_action', None)
+
         for n in range(self.horizon_length):
             if n % self.seq_length == 0:
                 for s, mb_s in zip(self.rnn_states, mb_rnn_states):
@@ -930,7 +933,7 @@ class A2CBase(BaseAlgorithm):
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
-                res_dict = self.get_action_values(self.obs)
+                res_dict = self.get_action_values(self.obs, prev_actions=_prev_action)
 
             self.rnn_states = res_dict['rnn_states']
             self.experience_buffer.update_data('obses', n, self._get_obs_to_store())
@@ -985,6 +988,11 @@ class A2CBase(BaseAlgorithm):
                 if self.has_central_value:
                     self.central_value_net.post_step_rnn(all_done_indices)
 
+            # Update previous action for next step; zero out for envs that just reset
+            _prev_action = res_dict['actions'].clone()
+            if len(all_done_indices) > 0:
+                _prev_action[all_done_indices] = 0.0
+
             self.game_rewards.update(self.current_rewards[env_done_indices])
             self.game_shaped_rewards.update(self.current_shaped_rewards[env_done_indices])
             self.game_lengths.update(self.current_lengths[env_done_indices])
@@ -995,6 +1003,9 @@ class A2CBase(BaseAlgorithm):
             self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
             self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
             self.current_lengths = self.current_lengths * not_dones
+
+        # Persist previous action across rollout calls
+        self._rollout_prev_action = _prev_action
 
         last_values = self.get_values(self.obs)
 
