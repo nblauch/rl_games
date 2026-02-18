@@ -55,6 +55,9 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.dataset = datasets.PPODataset(self.batch_size, self.minibatch_size, self.is_discrete, self.is_rnn, self.ppo_device, self.seq_length)
         if self.normalize_value:
             self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
+            # MORL: separate fixation value normalizer
+            if getattr(self, 'separate_fix_critic', False) and hasattr(self.model, 'value_mean_std_fix'):
+                self.value_mean_std_fix = self.model.value_mean_std_fix
 
         self.has_value_loss = self.use_experimental_cv or not self.has_central_value
         self.algo_observer.after_init(self)

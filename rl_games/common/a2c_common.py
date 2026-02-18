@@ -762,6 +762,9 @@ class A2CBase(BaseAlgorithm):
                 state['running_mean_std'] = self.model.running_mean_std.state_dict()
             if self.normalize_value:
                 state['reward_mean_std'] = self.model.value_mean_std.state_dict()
+                # MORL: save fixation value normalizer
+                if hasattr(self.model, 'value_mean_std_fix'):
+                    state['reward_mean_std_fix'] = self.model.value_mean_std_fix.state_dict()
 
         return state
 
@@ -772,6 +775,9 @@ class A2CBase(BaseAlgorithm):
             self.model.running_mean_std.load_state_dict(weights['running_mean_std'])
         if self.normalize_value and 'normalize_value' in weights:
             self.model.value_mean_std.load_state_dict(weights['reward_mean_std'])
+        # MORL: load fixation value normalizer
+        if self.normalize_value and 'reward_mean_std_fix' in weights and hasattr(self.model, 'value_mean_std_fix'):
+            self.model.value_mean_std_fix.load_state_dict(weights['reward_mean_std_fix'])
         if self.mixed_precision and 'scaler' in weights:
             self.scaler.load_state_dict(weights['scaler'])
 
@@ -1518,9 +1524,12 @@ class ContinuousA2CBase(A2CBase):
             values_fix = batch_dict.get('values_fix')
             advantages_fix = batch_dict.get('advantages_fix')
             if returns_fix is not None and values_fix is not None:
-                if self.normalize_value:
-                    values_fix = self.value_mean_std(values_fix)
-                    returns_fix = self.value_mean_std(returns_fix)
+                # Use separate fixation value normalizer if available
+                if self.normalize_value and hasattr(self, 'value_mean_std_fix'):
+                    self.value_mean_std_fix.train()
+                    values_fix = self.value_mean_std_fix(values_fix)
+                    returns_fix = self.value_mean_std_fix(returns_fix)
+                    self.value_mean_std_fix.eval()
                 advantages_fix = torch.sum(advantages_fix, axis=1) if advantages_fix is not None else torch.sum(returns_fix - values_fix, axis=1)
                 if self.normalize_advantage:
                     if self.is_rnn:
