@@ -970,7 +970,7 @@ class A2CBase(BaseAlgorithm):
 
             # Seq-JEPA: compute prediction for this step (using sampled action)
             if _seqjepa_online and _seqjepa_net is not None:
-                _seqjepa_prev_pred = _seqjepa_net.compute_seqjepa_prediction(res_dict['actions'])
+                _seqjepa_prev_pred = _seqjepa_net.compute_seqjepa_prediction(res_dict['actions'], obs=self.obs)
                 _seqjepa_prev_dones = self.dones
 
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
