@@ -903,13 +903,23 @@ class A2CBase(BaseAlgorithm):
 
         return batch_dict
 
+    def _seqjepa_resolve_current_repr(self, net):
+        """Resolve the current seq-JEPA representation from the network's stash."""
+        if getattr(net, '_seqjepa_separate_losses', False):
+            repr_p = getattr(net, '_last_seqjepa_repr_proprio', None)
+            repr_v = getattr(net, '_last_seqjepa_repr_vision', None)
+            if repr_p is not None and repr_v is not None:
+                return torch.cat([repr_p, repr_v], dim=-1)
+            return None
+        return getattr(net, '_last_seqjepa_repr', None)
+
     def play_steps_rnn(self):
         update_list = self.update_list
         mb_rnn_states = self.mb_rnn_states
         step_time = 0.0
 
-        # Seq-JEPA online intrinsic reward state
-        _seqjepa_online = getattr(self, 'seqjepa_enabled', False) and getattr(self, 'seqjepa_rew_lambda', 0.0) > 0
+        # Seq-JEPA online prediction state
+        _seqjepa_online = getattr(self, 'seqjepa_enabled', False)
         _seqjepa_prev_pred = None
         _seqjepa_prev_dones = None
         _seqjepa_net = None
@@ -945,11 +955,11 @@ class A2CBase(BaseAlgorithm):
                 self.experience_buffer.update_data('states', n, self.obs['states'])
 
             # Seq-JEPA: compute intrinsic reward from previous prediction vs current repr
-            seqjepa_intrinsic = None
-            if _seqjepa_online and _seqjepa_net is not None:
-                current_repr = getattr(_seqjepa_net, '_last_seqjepa_repr', None)
-                if _seqjepa_prev_pred is not None and current_repr is not None:
-                    seqjepa_intrinsic = _seqjepa_net.compute_seqjepa_intrinsic_reward(
+            self._last_seqjepa_intrinsic = None
+            if _seqjepa_online and _seqjepa_net is not None and _seqjepa_prev_pred is not None:
+                current_repr = self._seqjepa_resolve_current_repr(_seqjepa_net)
+                if current_repr is not None:
+                    self._last_seqjepa_intrinsic = _seqjepa_net.compute_seqjepa_intrinsic_reward(
                         _seqjepa_prev_pred, current_repr, _seqjepa_prev_dones
                     )
 
@@ -965,10 +975,10 @@ class A2CBase(BaseAlgorithm):
                 shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
 
             # Add seq-JEPA intrinsic reward
-            if seqjepa_intrinsic is not None:
-                shaped_rewards = shaped_rewards + self.seqjepa_rew_lambda * seqjepa_intrinsic
+            if self._last_seqjepa_intrinsic is not None and getattr(self, 'seqjepa_rew_lambda', 0.0) > 0:
+                shaped_rewards = shaped_rewards + self.seqjepa_rew_lambda * self._last_seqjepa_intrinsic
 
-            # Seq-JEPA: compute prediction for this step (using sampled action)
+            # Seq-JEPA: compute prediction for this step
             if _seqjepa_online and _seqjepa_net is not None:
                 _seqjepa_prev_pred = _seqjepa_net.compute_seqjepa_prediction(res_dict['actions'], obs=self.obs)
                 _seqjepa_prev_dones = self.dones
