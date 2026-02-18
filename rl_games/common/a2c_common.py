@@ -43,6 +43,28 @@ def rescale_actions(low, high, action):
     return scaled_action
 
 
+def preprocess_continuous_actions(actions, actions_low, actions_high,
+                                  norm_length_action_indices=()):
+    """Clamp+rescale continuous actions, with optional L2-norm preprocessing for grouped indices.
+
+    For norm_length_action_indices: raw vector is L2-clamped to unit ball then scaled by
+    actions_high (radius semantics), bypassing per-component clamp+rescale.
+    """
+    clamped = torch.clamp(actions, -1.0, 1.0)
+    result = rescale_actions(actions_low, actions_high, clamped)
+
+    if norm_length_action_indices:
+        idx = norm_length_action_indices
+        raw_vec = actions[..., idx]
+        mag = raw_vec.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        clamped_vec = raw_vec * (mag.clamp(max=1.0) / mag)
+        radius = actions_high[idx[0]]
+        result = result.clone()
+        result[..., idx] = clamped_vec * radius
+
+    return result
+
+
 def print_statistics(print_stats, curr_frames, step_time, step_inference_time, total_time, epoch_num, max_epochs, frame, max_frames):
     if print_stats:
         step_time = max(step_time, 1e-9)
@@ -1381,10 +1403,19 @@ class ContinuousA2CBase(A2CBase):
         self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
         self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
 
+        self._norm_length_action_indices = self.env_info.get('norm_length_action_indices', [])
+        if self._norm_length_action_indices:
+            highs = self.actions_high[self._norm_length_action_indices]
+            assert (highs == highs[0]).all(), (
+                f"actions_high for norm_length_action_indices must all be equal, got {highs.tolist()}"
+            )
+
     def preprocess_actions(self, actions):
         if self.clip_actions:
-            clamped_actions = torch.clamp(actions, -1.0, 1.0)
-            rescaled_actions = rescale_actions(self.actions_low, self.actions_high, clamped_actions)
+            rescaled_actions = preprocess_continuous_actions(
+                actions, self.actions_low, self.actions_high,
+                self._norm_length_action_indices,
+            )
         else:
             rescaled_actions = actions
 
