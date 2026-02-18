@@ -111,10 +111,28 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             mu = res_dict['mus']
             sigma = res_dict['sigmas']
 
-            a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
+            # MORL: separate actor losses for arm and fixation
+            if getattr(self, 'separate_fix_critic', False) and 'neglogpacs_arm' in res_dict:
+                advantage_fix = input_dict.get('advantages_fix', torch.zeros_like(advantage))
+                old_logp_arm = input_dict['old_logp_actions_arm']
+                old_logp_fix = input_dict['old_logp_actions_fix']
+                new_logp_arm = res_dict['neglogpacs_arm']
+                new_logp_fix = res_dict['neglogpacs_fix']
+                a_loss_arm = self.actor_loss_func(old_logp_arm, new_logp_arm, advantage, self.ppo, curr_e_clip)
+                a_loss_fix = self.actor_loss_func(old_logp_fix, new_logp_fix, advantage + advantage_fix, self.ppo, curr_e_clip)
+                a_loss = a_loss_arm + a_loss_fix
+            else:
+                a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
 
             if self.has_value_loss:
                 c_loss = common_losses.critic_loss(self.model,value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
+                # MORL: add fixation critic loss
+                if getattr(self, 'separate_fix_critic', False) and 'values_fix' in res_dict:
+                    values_fix = res_dict['values_fix']
+                    return_fix = input_dict.get('returns_fix', torch.zeros_like(return_batch))
+                    old_values_fix = input_dict.get('old_values_fix', torch.zeros_like(value_preds_batch))
+                    c_loss_fix = common_losses.critic_loss(self.model, old_values_fix, values_fix, curr_e_clip, return_fix, self.clip_value)
+                    c_loss = c_loss + c_loss_fix
             else:
                 c_loss = torch.zeros(1, device=self.ppo_device)
             if self.bound_loss_type == 'regularisation':

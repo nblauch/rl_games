@@ -439,6 +439,8 @@ class A2CBase(BaseAlgorithm):
                 }
                 result = self.model(input_dict)
                 value = result['values']
+                if self.separate_fix_critic and 'values_fix' in result:
+                    self._last_values_fix = result['values_fix']
             return value
 
     @property
@@ -903,6 +905,14 @@ class A2CBase(BaseAlgorithm):
 
         return batch_dict
 
+    def _get_last_fix_values(self):
+        """Get fixation value from the most recent forward pass.
+
+        get_values already ran a full forward; the model returns values_fix in the result dict.
+        We stash it in _last_values_fix during get_values calls.
+        """
+        return getattr(self, '_last_values_fix', torch.zeros(self.num_actors * self.num_agents, 1, device=self.ppo_device))
+
     def _seqjepa_resolve_current_repr(self, net):
         """Resolve the current seq-JEPA representation from the network's stash."""
         if getattr(net, '_seqjepa_separate_losses', False):
@@ -917,6 +927,14 @@ class A2CBase(BaseAlgorithm):
         update_list = self.update_list
         mb_rnn_states = self.mb_rnn_states
         step_time = 0.0
+
+        # MORL: allocate fixation reward and value buffers
+        if self.separate_fix_critic:
+            _n = self.num_actors * self.num_agents
+            self._fix_rewards_buffer = torch.zeros(self.horizon_length, _n, 1, device=self.ppo_device)
+            self._fix_values_buffer = torch.zeros(self.horizon_length, _n, 1, device=self.ppo_device)
+            self._neglogpacs_arm_buffer = torch.zeros(self.horizon_length, _n, device=self.ppo_device)
+            self._neglogpacs_fix_buffer = torch.zeros(self.horizon_length, _n, device=self.ppo_device)
 
         # Seq-JEPA online prediction state
         _seqjepa_online = getattr(self, 'seqjepa_enabled', False)
@@ -953,6 +971,11 @@ class A2CBase(BaseAlgorithm):
                 self.experience_buffer.update_data(k, n, res_dict[k])
             if self.has_central_value:
                 self.experience_buffer.update_data('states', n, self.obs['states'])
+            # MORL: store separate fixation values and log probs
+            if self.separate_fix_critic:
+                self._fix_values_buffer[n] = res_dict.get('values_fix', torch.zeros_like(res_dict['values']))
+                self._neglogpacs_arm_buffer[n] = res_dict.get('neglogpacs_arm', torch.zeros_like(res_dict['neglogpacs']))
+                self._neglogpacs_fix_buffer[n] = res_dict.get('neglogpacs_fix', torch.zeros_like(res_dict['neglogpacs']))
 
             # Seq-JEPA: compute intrinsic reward from previous prediction vs current repr
             self._last_seqjepa_intrinsic = None
@@ -984,6 +1007,19 @@ class A2CBase(BaseAlgorithm):
                 _seqjepa_prev_dones = self.dones
 
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
+
+            # MORL: store fixation rewards separately
+            if self.separate_fix_critic:
+                fix_rew = infos.get('fix_reward', torch.zeros_like(rewards))
+                if not isinstance(fix_rew, torch.Tensor):
+                    fix_rew = torch.tensor(fix_rew, device=self.ppo_device, dtype=torch.float32)
+                if fix_rew.dim() == 1:
+                    fix_rew = fix_rew.unsqueeze(1)
+                shaped_fix_rew = self.rewards_shaper(fix_rew)
+                if self.value_bootstrap and 'time_outs' in infos:
+                    values_fix = res_dict.get('values_fix', torch.zeros_like(res_dict['values']))
+                    shaped_fix_rew = shaped_fix_rew + self.gamma * values_fix * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
+                self._fix_rewards_buffer[n] = shaped_fix_rew
 
             self.current_rewards += rewards
             self.current_shaped_rewards += shaped_rewards
@@ -1030,6 +1066,18 @@ class A2CBase(BaseAlgorithm):
 
         batch_dict['returns'] = swap_and_flatten01(mb_returns)
         batch_dict['played_frames'] = self.batch_size
+
+        # MORL: compute separate fixation advantage
+        if self.separate_fix_critic:
+            mb_values_fix = self._fix_values_buffer
+            last_values_fix = self._get_last_fix_values()
+            mb_advs_fix = self.discount_values(fdones, last_values_fix, mb_fdones, mb_values_fix, self._fix_rewards_buffer)
+            mb_returns_fix = mb_advs_fix + mb_values_fix
+            batch_dict['returns_fix'] = swap_and_flatten01(mb_returns_fix)
+            batch_dict['advantages_fix'] = swap_and_flatten01(mb_advs_fix)
+            batch_dict['values_fix'] = swap_and_flatten01(self._fix_values_buffer)
+            batch_dict['neglogpacs_arm'] = swap_and_flatten01(self._neglogpacs_arm_buffer)
+            batch_dict['neglogpacs_fix'] = swap_and_flatten01(self._neglogpacs_fix_buffer)
         states = []
         for mb_s in mb_rnn_states:
             t_size = mb_s.size()[0] * mb_s.size()[2]
@@ -1320,6 +1368,9 @@ class ContinuousA2CBase(A2CBase):
         self.seqjepa_rew_lambda = seqjepa_cfg.get('rew_lambda', 0.0)
         self.seqjepa_ema_tau = seqjepa_cfg.get('ema_tau', 0.99)
 
+        vision_policy_cfg = network_params.get('vision_policy', {}) if isinstance(network_params, dict) else {}
+        self.separate_fix_critic = vision_policy_cfg.get('separate_fix_critic', False)
+
         # todo introduce device instead of cuda()
         self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
         self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
@@ -1460,6 +1511,27 @@ class ContinuousA2CBase(A2CBase):
         dataset_dict['rnn_masks'] = rnn_masks
         dataset_dict['mu'] = mus
         dataset_dict['sigma'] = sigmas
+
+        # MORL: separate fixation advantages
+        if self.separate_fix_critic:
+            returns_fix = batch_dict.get('returns_fix')
+            values_fix = batch_dict.get('values_fix')
+            advantages_fix = batch_dict.get('advantages_fix')
+            if returns_fix is not None and values_fix is not None:
+                if self.normalize_value:
+                    values_fix = self.value_mean_std(values_fix)
+                    returns_fix = self.value_mean_std(returns_fix)
+                advantages_fix = torch.sum(advantages_fix, axis=1) if advantages_fix is not None else torch.sum(returns_fix - values_fix, axis=1)
+                if self.normalize_advantage:
+                    if self.is_rnn:
+                        advantages_fix = torch_ext.normalization_with_masks(advantages_fix, rnn_masks)
+                    else:
+                        advantages_fix = (advantages_fix - advantages_fix.mean()) / (advantages_fix.std() + 1e-8)
+                dataset_dict['advantages_fix'] = advantages_fix
+                dataset_dict['returns_fix'] = returns_fix
+                dataset_dict['old_values_fix'] = values_fix
+            dataset_dict['old_logp_actions_arm'] = batch_dict.get('neglogpacs_arm')
+            dataset_dict['old_logp_actions_fix'] = batch_dict.get('neglogpacs_fix')
 
         self.dataset.update_values_dict(dataset_dict)
 
