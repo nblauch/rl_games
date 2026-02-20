@@ -519,16 +519,9 @@ class A2CBase(BaseAlgorithm):
                     f"trainable parameters (first 5: {trainable[:5]}). "
                     "Caching is only valid when the backbone is fully frozen."
                 )
-            # Level 2: store backbone features (pos_emb re-applied during training via cached fixation data)
             num_features = net._vision_num_features
             new_spaces['encoder_features'] = gym.spaces.Box(
                 low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32
-            )
-            new_spaces['fixations'] = gym.spaces.Box(
-                low=-1.0, high=1.0, shape=(2,), dtype=np.float32
-            )
-            new_spaces['fix_deltas'] = gym.spaces.Box(
-                low=-1.0, high=1.0, shape=(2,), dtype=np.float32
             )
             # Also cache raw hook activations when hook features are enabled
             if getattr(net, '_use_hook_features', False):
@@ -551,12 +544,6 @@ class A2CBase(BaseAlgorithm):
             new_spaces['retinal_features'] = gym.spaces.Box(
                 low=-np.inf, high=np.inf, shape=(n_channels, crop_n), dtype=np.float32
             )
-            new_spaces['fixations'] = gym.spaces.Box(
-                low=-1.0, high=1.0, shape=(2,), dtype=np.float32
-            )
-            new_spaces['fix_deltas'] = gym.spaces.Box(
-                low=-1.0, high=1.0, shape=(2,), dtype=np.float32
-            )
             self.cache_retinal_features = True
             print(f"[Vision Caching] Caching retinal features (shape=({n_channels}, {crop_n})) instead of images")
 
@@ -573,8 +560,8 @@ class A2CBase(BaseAlgorithm):
             result = {
                 'proprio': self.obs['obs']['proprio'],
                 'encoder_features': net._last_vision_features,
-                'fixations': net._last_fixations,
-                'fix_deltas': net._last_fix_deltas,
+                'fixations': self.obs['obs']['fixations'],
+                'fix_deltas': self.obs['obs']['fix_deltas'],
             }
             if getattr(net, '_use_hook_features', False):
                 result['token_features'] = net._last_token_features
@@ -584,8 +571,8 @@ class A2CBase(BaseAlgorithm):
             return {
                 'proprio': self.obs['obs']['proprio'],
                 'retinal_features': net._last_foveated_crops,
-                'fixations': net._last_fixations,
-                'fix_deltas': net._last_fix_deltas,
+                'fixations': self.obs['obs']['fixations'],
+                'fix_deltas': self.obs['obs']['fix_deltas'],
             }
         else:
             return self.obs['obs']
