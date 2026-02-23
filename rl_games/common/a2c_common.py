@@ -1394,6 +1394,7 @@ class ContinuousA2CBase(A2CBase):
 
         vision_policy_cfg = network_params.get('vision_policy', {}) if isinstance(network_params, dict) else {}
         self.separate_fix_critic = vision_policy_cfg.get('separate_fix_critic', False)
+        self.fix_critic_vision_only = vision_policy_cfg.get('fix_critic_vision_only', False)
 
         # todo introduce device instead of cuda()
         self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
