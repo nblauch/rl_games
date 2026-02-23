@@ -71,6 +71,9 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.dataset = datasets.PPODataset(self.batch_size, self.minibatch_size, self.is_discrete, self.is_rnn, self.ppo_device, self.seq_length)
         if self.normalize_value:
             self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
+            # MORL: separate fixation value normalizer
+            if getattr(self, 'separate_fix_critic', False) and hasattr(self.model, 'value_mean_std_fix'):
+                self.value_mean_std_fix = self.model.value_mean_std_fix
 
         self.has_value_loss = self.use_experimental_cv or not self.has_central_value
         self.algo_observer.after_init(self)
@@ -106,9 +109,24 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         return_batch,
         mu,
         entropy,
-        rnn_masks
+        rnn_masks,
+        res_dict=None,
+        input_dict=None,
     ):
-        a_loss = actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
+        # MORL: separate actor losses for arm and fixation
+        if getattr(self, 'separate_fix_critic', False) and res_dict is not None and 'neglogpacs_arm' in res_dict:
+            advantage_fix = input_dict['advantages_fix']
+            old_logp_arm = input_dict['old_logp_actions_arm']
+            old_logp_fix = input_dict['old_logp_actions_fix']
+            new_logp_arm = res_dict['neglogpacs_arm']
+            new_logp_fix = res_dict['neglogpacs_fix']
+            a_loss_arm = actor_loss_func(old_logp_arm, new_logp_arm, advantage, self.ppo, curr_e_clip)
+            fix_advantage = advantage_fix if getattr(self, 'fix_critic_vision_only', False) else advantage + advantage_fix
+            a_loss_fix = actor_loss_func(old_logp_fix, new_logp_fix, fix_advantage, self.ppo, curr_e_clip)
+            a_loss = a_loss_arm + a_loss_fix
+        else:
+            a_loss = actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
+
         if self.has_value_loss:
             c_loss = common_losses.critic_loss(
                 self.model,
@@ -118,6 +136,13 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 return_batch,
                 self.clip_value
             )
+            # MORL: add fixation critic loss
+            if getattr(self, 'separate_fix_critic', False) and res_dict is not None and 'values_fix' in res_dict:
+                values_fix = res_dict['values_fix']
+                return_fix = input_dict['returns_fix']
+                old_values_fix = input_dict['old_values_fix']
+                c_loss_fix = common_losses.critic_loss(self.model, old_values_fix, values_fix, curr_e_clip, return_fix, self.clip_value)
+                c_loss = c_loss + c_loss_fix
         else:
             c_loss = torch.zeros(1, device=self.ppo_device)
         if self.bound_loss_type == 'regularisation':
@@ -188,7 +213,9 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                 return_batch,
                 mu,
                 entropy,
-                rnn_masks
+                rnn_masks,
+                res_dict=res_dict,
+                input_dict=input_dict,
             )
 
             aux_loss = self.model.get_aux_loss()
@@ -201,6 +228,12 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
                     else:
                         self.aux_loss_dict[k] = [v.detach()]
 
+            seqjepa_loss = torch.zeros(1, device=self.ppo_device)
+            if getattr(self, 'seqjepa_enabled', False) and 'seqjepa_aux_loss' in res_dict:
+                seqjepa_loss = res_dict['seqjepa_aux_loss']
+                if getattr(self, 'seqjepa_aux_lambda', 0.0) != 0:
+                    loss = loss + self.seqjepa_aux_lambda * seqjepa_loss
+
             if self.multi_gpu:
                 self.optimizer.zero_grad(set_to_none=True)
             else:
@@ -210,6 +243,9 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.scaler.scale(loss).backward()
         #TODO: Refactor this ugliest code of they year
         self.trancate_gradients_and_step()
+        if getattr(self, 'seqjepa_enabled', False) and hasattr(self.model, 'a2c_network') and hasattr(self.model.a2c_network, 'update_target_encoder'):
+            tau = getattr(self, 'seqjepa_ema_tau', 0.99)
+            self.model.a2c_network.update_target_encoder(tau)
 
         with torch.no_grad():
             reduce_kl = rnn_masks is None
@@ -228,7 +264,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
         self.train_result = (a_loss, c_loss, entropy,
             kl_dist, self.last_lr, lr_mul,
-            mu.detach(), sigma.detach(), b_loss)
+            mu.detach(), sigma.detach(), b_loss, seqjepa_loss)
 
     def train_actor_critic(self, input_dict):
         self.set_train()

@@ -1,4 +1,5 @@
 from rl_games.common.player import BasePlayer
+from rl_games.common.a2c_common import preprocess_continuous_actions
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.common.tr_helpers import unsqueeze_obs
@@ -23,6 +24,12 @@ class PpoPlayerContinuous(BasePlayer):
         self.actions_low = torch.from_numpy(self.action_space.low.copy()).float().to(self.device)
         self.actions_high = torch.from_numpy(self.action_space.high.copy()).float().to(self.device)
         self.mask = [False]
+        self._norm_length_action_indices = self.env_info.get('norm_length_action_indices', [])
+        if self._norm_length_action_indices:
+            highs = self.actions_high[self._norm_length_action_indices]
+            assert (highs == highs[0]).all(), (
+                f"actions_high for norm_length_action_indices must all be equal, got {highs.tolist()}"
+            )
 
         self.normalize_input = self.config['normalize_input']
         self.normalize_value = self.config.get('normalize_value', False)
@@ -64,7 +71,10 @@ class PpoPlayerContinuous(BasePlayer):
             current_action = torch.squeeze(current_action.detach())
 
         if self.clip_actions:
-            return rescale_actions(self.actions_low, self.actions_high, torch.clamp(current_action, -1.0, 1.0))
+            return preprocess_continuous_actions(
+                current_action, self.actions_low, self.actions_high,
+                self._norm_length_action_indices,
+            )
         else:
             return current_action
 

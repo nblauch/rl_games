@@ -22,6 +22,9 @@ class AlgoObserver:
     def after_print_stats(self, frame, epoch_num, total_time):
         pass
 
+    def on_checkpoint_saved(self, checkpoint_path, epoch_num):
+        pass
+
 
 class DefaultAlgoObserver(AlgoObserver):
     def __init__(self):
