@@ -461,8 +461,7 @@ class A2CBase(BaseAlgorithm):
                 }
                 result = self.model(input_dict)
                 value = result['values']
-                if self.separate_fix_critic and 'values_fix' in result:
-                    self._last_values_fix = result['values_fix']
+                self._on_get_values_result(result)
             return value
 
     @property
@@ -577,8 +576,45 @@ class A2CBase(BaseAlgorithm):
         else:
             return self.obs['obs']
 
-    def init_tensors(self):
+    def _pre_init_tensors(self):
+        """Called before init_tensors. Override for setup that must happen before buffer allocation."""
         self._setup_vision_caching()
+
+    def _on_get_values_result(self, result):
+        """Called after get_values model forward. Override to stash extra outputs."""
+        if self.separate_fix_critic and 'values_fix' in result:
+            self._last_values_fix = result['values_fix']
+
+    def _play_steps_rnn_init(self):
+        """Called at start of play_steps_rnn. Override to allocate per-rollout buffers."""
+        pass
+
+    def _play_steps_rnn_on_action(self, n, res_dict):
+        """Called after get_action_values, before env_step. Override to process action results."""
+        pass
+
+    def _play_steps_rnn_on_reward(self, n, shaped_rewards, infos, res_dict):
+        """Called after reward shaping. Override to modify rewards. Must return shaped_rewards."""
+        return shaped_rewards
+
+    def _play_steps_rnn_post_step(self, n, res_dict):
+        """Called after done handling. Override for per-step bookkeeping."""
+        pass
+
+    def _play_steps_rnn_finalize(self, batch_dict):
+        """Called before returning batch_dict. Override to add entries. Must return batch_dict."""
+        return batch_dict
+
+    def _save_checkpoint_at(self, save_type, epoch_num, checkpoint_name=None, mean_rewards=None):
+        """Called for checkpoint saves. Override for custom checkpoint behavior."""
+        latest_path = os.path.join(self.nn_dir, 'latest_' + self.config['name'])
+        if save_type == 'periodic':
+            print('saving most recent model')
+        self.save(latest_path)
+        self.algo_observer.on_checkpoint_saved(latest_path, epoch_num)
+
+    def init_tensors(self):
+        self._pre_init_tensors()
         batch_size = self.num_agents * self.num_actors
         algo_info = {
             'num_actors' : self.num_actors,
@@ -929,49 +965,12 @@ class A2CBase(BaseAlgorithm):
 
         return batch_dict
 
-    def _get_last_fix_values(self):
-        """Get fixation value from the most recent forward pass.
-
-        get_values already ran a full forward; the model returns values_fix in the result dict.
-        We stash it in _last_values_fix during get_values calls.
-        """
-        return getattr(self, '_last_values_fix', torch.zeros(self.num_actors * self.num_agents, 1, device=self.ppo_device))
-
-    def _seqjepa_resolve_current_repr(self, net):
-        """Resolve the current seq-JEPA representation from the network's stash."""
-        if getattr(net, '_seqjepa_separate_losses', False):
-            repr_p = getattr(net, '_last_seqjepa_repr_proprio', None)
-            repr_v = getattr(net, '_last_seqjepa_repr_vision', None)
-            if repr_p is not None and repr_v is not None:
-                return torch.cat([repr_p, repr_v], dim=-1)
-            return None
-        return getattr(net, '_last_seqjepa_repr', None)
-
     def play_steps_rnn(self):
         update_list = self.update_list
         mb_rnn_states = self.mb_rnn_states
         step_time = 0.0
 
-        # MORL: allocate fixation reward and value buffers
-        if self.separate_fix_critic:
-            _n = self.num_actors * self.num_agents
-            self._fix_rewards_buffer = torch.zeros(self.horizon_length, _n, 1, device=self.ppo_device)
-            self._fix_values_buffer = torch.zeros(self.horizon_length, _n, 1, device=self.ppo_device)
-            self._neglogpacs_arm_buffer = torch.zeros(self.horizon_length, _n, device=self.ppo_device)
-            self._neglogpacs_fix_buffer = torch.zeros(self.horizon_length, _n, device=self.ppo_device)
-
-        # Seq-JEPA online prediction state
-        _seqjepa_online = getattr(self, 'seqjepa_enabled', False)
-        _seqjepa_prev_pred = None
-        _seqjepa_prev_dones = None
-        _seqjepa_net = None
-        if _seqjepa_online and hasattr(self.model, 'a2c_network'):
-            _seqjepa_net = self.model.a2c_network
-        elif _seqjepa_online and hasattr(self.model, 'module') and hasattr(self.model.module, 'a2c_network'):
-            _seqjepa_net = self.model.module.a2c_network
-
-        # Track previous action for concat_actions pos emb (action that led to current state)
-        _prev_action = getattr(self, '_rollout_prev_action', None)
+        self._play_steps_rnn_init()
 
         for n in range(self.horizon_length):
             if n % self.seq_length == 0:
@@ -985,7 +984,7 @@ class A2CBase(BaseAlgorithm):
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
-                res_dict = self.get_action_values(self.obs, prev_actions=_prev_action)
+                res_dict = self.get_action_values(self.obs)
 
             self.rnn_states = res_dict['rnn_states']
             self.experience_buffer.update_data('obses', n, self._get_obs_to_store())
@@ -995,20 +994,8 @@ class A2CBase(BaseAlgorithm):
                 self.experience_buffer.update_data(k, n, res_dict[k])
             if self.has_central_value:
                 self.experience_buffer.update_data('states', n, self.obs['states'])
-            # MORL: store separate fixation values and log probs
-            if self.separate_fix_critic:
-                self._fix_values_buffer[n] = res_dict.get('values_fix', torch.zeros_like(res_dict['values']))
-                self._neglogpacs_arm_buffer[n] = res_dict.get('neglogpacs_arm', torch.zeros_like(res_dict['neglogpacs']))
-                self._neglogpacs_fix_buffer[n] = res_dict.get('neglogpacs_fix', torch.zeros_like(res_dict['neglogpacs']))
 
-            # Seq-JEPA: compute intrinsic reward from previous prediction vs current repr
-            self._last_seqjepa_intrinsic = None
-            if _seqjepa_online and _seqjepa_net is not None and _seqjepa_prev_pred is not None:
-                current_repr = self._seqjepa_resolve_current_repr(_seqjepa_net)
-                if current_repr is not None:
-                    self._last_seqjepa_intrinsic = _seqjepa_net.compute_seqjepa_intrinsic_reward(
-                        _seqjepa_prev_pred, current_repr, _seqjepa_prev_dones
-                    )
+            self._play_steps_rnn_on_action(n, res_dict)
 
             step_time_start = time.time()
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
@@ -1021,29 +1008,9 @@ class A2CBase(BaseAlgorithm):
             if self.value_bootstrap and 'time_outs' in infos:
                 shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
 
-            # Add seq-JEPA intrinsic reward
-            if self._last_seqjepa_intrinsic is not None and getattr(self, 'seqjepa_rew_lambda', 0.0) > 0:
-                shaped_rewards = shaped_rewards + self.seqjepa_rew_lambda * self._last_seqjepa_intrinsic
-
-            # Seq-JEPA: compute prediction for this step
-            if _seqjepa_online and _seqjepa_net is not None:
-                _seqjepa_prev_pred = _seqjepa_net.compute_seqjepa_prediction(res_dict['actions'], obs=self.obs)
-                _seqjepa_prev_dones = self.dones
+            shaped_rewards = self._play_steps_rnn_on_reward(n, shaped_rewards, infos, res_dict)
 
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
-
-            # MORL: store fixation rewards separately
-            if self.separate_fix_critic:
-                fix_rew = infos.get('fix_reward', torch.zeros_like(rewards))
-                if not isinstance(fix_rew, torch.Tensor):
-                    fix_rew = torch.tensor(fix_rew, device=self.ppo_device, dtype=torch.float32)
-                if fix_rew.dim() == 1:
-                    fix_rew = fix_rew.unsqueeze(1)
-                shaped_fix_rew = self.rewards_shaper(fix_rew)
-                if self.value_bootstrap and 'time_outs' in infos:
-                    values_fix = res_dict.get('values_fix', torch.zeros_like(res_dict['values']))
-                    shaped_fix_rew = shaped_fix_rew + self.gamma * values_fix * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
-                self._fix_rewards_buffer[n] = shaped_fix_rew
 
             self.current_rewards += rewards
             self.current_shaped_rewards += shaped_rewards
@@ -1058,10 +1025,7 @@ class A2CBase(BaseAlgorithm):
                 if self.has_central_value:
                     self.central_value_net.post_step_rnn(all_done_indices)
 
-            # Update previous action for next step; zero out for envs that just reset
-            _prev_action = res_dict['actions'].clone()
-            if len(all_done_indices) > 0:
-                _prev_action[all_done_indices] = 0.0
+            self._play_steps_rnn_post_step(n, res_dict)
 
             self.game_rewards.update(self.current_rewards[env_done_indices])
             self.game_shaped_rewards.update(self.current_shaped_rewards[env_done_indices])
@@ -1073,9 +1037,6 @@ class A2CBase(BaseAlgorithm):
             self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
             self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
             self.current_lengths = self.current_lengths * not_dones
-
-        # Persist previous action across rollout calls
-        self._rollout_prev_action = _prev_action
 
         last_values = self.get_values(self.obs)
 
@@ -1090,18 +1051,6 @@ class A2CBase(BaseAlgorithm):
 
         batch_dict['returns'] = swap_and_flatten01(mb_returns)
         batch_dict['played_frames'] = self.batch_size
-
-        # MORL: compute separate fixation advantage
-        if self.separate_fix_critic:
-            mb_values_fix = self._fix_values_buffer
-            last_values_fix = self._get_last_fix_values()
-            mb_advs_fix = self.discount_values(fdones, last_values_fix, mb_fdones, mb_values_fix, self._fix_rewards_buffer)
-            mb_returns_fix = mb_advs_fix + mb_values_fix
-            batch_dict['returns_fix'] = swap_and_flatten01(mb_returns_fix)
-            batch_dict['advantages_fix'] = swap_and_flatten01(mb_advs_fix)
-            batch_dict['values_fix'] = swap_and_flatten01(self._fix_values_buffer)
-            batch_dict['neglogpacs_arm'] = swap_and_flatten01(self._neglogpacs_arm_buffer)
-            batch_dict['neglogpacs_fix'] = swap_and_flatten01(self._neglogpacs_fix_buffer)
         states = []
         for mb_s in mb_rnn_states:
             t_size = mb_s.size()[0] * mb_s.size()[2]
@@ -1110,6 +1059,8 @@ class A2CBase(BaseAlgorithm):
 
         batch_dict['rnn_states'] = states
         batch_dict['step_time'] = step_time
+
+        batch_dict = self._play_steps_rnn_finalize(batch_dict)
 
         return batch_dict
 
@@ -1296,8 +1247,6 @@ class DiscreteA2CBase(A2CBase):
 
                 self.algo_observer.after_print_stats(frame, epoch_num, total_time)
 
-                latest_checkpoint_path = os.path.join(self.nn_dir, 'latest_' + self.config['name'])
-
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self.game_rewards.get_mean()
                     mean_shaped_rewards = self.game_shaped_rewards.get_mean()
@@ -1324,12 +1273,9 @@ class DiscreteA2CBase(A2CBase):
                     # removed equal signs (i.e. "rew=") from the checkpoint name since it messes with hydra CLI parsing
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
-                    # Save checkpoint with fixed name for wandb upload (overwrites previous)
                     if self.save_freq > 0:
                         if epoch_num % self.save_freq == 0:
-                            print('saving most recent model')
-                            self.save(latest_checkpoint_path)
-                            self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
+                            self._save_checkpoint_at('periodic', epoch_num, checkpoint_name=checkpoint_name)
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print('saving next best rewards: ', mean_rewards)
@@ -1346,8 +1292,7 @@ class DiscreteA2CBase(A2CBase):
                         print('WARNING: Max epochs reached before any env terminated at least once')
                         mean_rewards = -np.inf
 
-                    self.save(latest_checkpoint_path)
-                    self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
+                    self._save_checkpoint_at('max_epochs', epoch_num, mean_rewards=mean_rewards)
                     print('MAX EPOCHS NUM!')
                     should_exit = True
 
@@ -1356,8 +1301,7 @@ class DiscreteA2CBase(A2CBase):
                         print('WARNING: Max frames reached before any env terminated at least once')
                         mean_rewards = -np.inf
 
-                    self.save(latest_checkpoint_path)
-                    self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
+                    self._save_checkpoint_at('max_frames', epoch_num, mean_rewards=mean_rewards)
                     print('MAX FRAMES NUM!')
                     should_exit = True
 
@@ -1421,6 +1365,22 @@ class ContinuousA2CBase(A2CBase):
 
         return rescaled_actions
 
+    def _on_dataset_prepared(self):
+        """Called after prepare_dataset. Override for observer updates."""
+        self.algo_observer.update_buffer(self.experience_buffer)
+
+    def _extend_dataset(self, dataset_dict, batch_dict):
+        """Called before update_values_dict. Override to add entries to dataset_dict."""
+        pass
+
+    def _on_train_step(self, train_result):
+        """Called after each train_actor_critic. Override to collect extra losses."""
+        pass
+
+    def _log_extra_losses(self, frame):
+        """Called after standard loss logging. Override to log extra losses."""
+        pass
+
     def init_tensors(self):
         A2CBase.init_tensors(self)
         self.update_list = ['actions', 'neglogpacs', 'values', 'mus', 'sigmas']
@@ -1444,7 +1404,7 @@ class ContinuousA2CBase(A2CBase):
         self.set_train()
         self.curr_frames = batch_dict.pop('played_frames')
         self.prepare_dataset(batch_dict)
-        self.algo_observer.update_buffer(self.experience_buffer)
+        self._on_dataset_prepared()
         self.algo_observer.after_steps()
         if self.has_central_value:
             self.train_central_value()
@@ -1452,7 +1412,6 @@ class ContinuousA2CBase(A2CBase):
         a_losses = []
         c_losses = []
         b_losses = []
-        seqjepa_losses = []
         entropies = []
         kls = []
 
@@ -1467,8 +1426,8 @@ class ContinuousA2CBase(A2CBase):
                 entropies.append(entropy)
                 if self.bounds_loss_coef is not None:
                     b_losses.append(b_loss)
-                if len(train_result) > 9:
-                    seqjepa_losses.append(train_result[9])
+
+                self._on_train_step(train_result)
 
                 self.dataset.update_mu_sigma(cmu, csigma)
                 if self.schedule_type == 'legacy':
@@ -1497,7 +1456,7 @@ class ContinuousA2CBase(A2CBase):
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, seqjepa_losses
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
 
     def prepare_dataset(self, batch_dict):
         obses = batch_dict['obses']
@@ -1546,30 +1505,7 @@ class ContinuousA2CBase(A2CBase):
         dataset_dict['mu'] = mus
         dataset_dict['sigma'] = sigmas
 
-        # MORL: separate fixation advantages
-        if self.separate_fix_critic:
-            returns_fix = batch_dict.get('returns_fix')
-            values_fix = batch_dict.get('values_fix')
-            advantages_fix = batch_dict.get('advantages_fix')
-            if returns_fix is not None and values_fix is not None:
-                # Use separate fixation value normalizer if available
-                if self.normalize_value and hasattr(self, 'value_mean_std_fix'):
-                    self.value_mean_std_fix.train()
-                    values_fix = self.value_mean_std_fix(values_fix)
-                    returns_fix = self.value_mean_std_fix(returns_fix)
-                    self.value_mean_std_fix.eval()
-                advantages_fix = torch.sum(advantages_fix, axis=1) if advantages_fix is not None else torch.sum(returns_fix - values_fix, axis=1)
-                if self.normalize_advantage:
-                    if self.is_rnn:
-                        advantages_fix = torch_ext.normalization_with_masks(advantages_fix, rnn_masks)
-                    else:
-                        advantages_fix = (advantages_fix - advantages_fix.mean()) / (advantages_fix.std() + 1e-8)
-                dataset_dict['advantages_fix'] = advantages_fix
-                dataset_dict['returns_fix'] = returns_fix
-                dataset_dict['old_values_fix'] = values_fix
-            dataset_dict['old_logp_actions_arm'] = batch_dict.get('neglogpacs_arm')
-            dataset_dict['old_logp_actions_fix'] = batch_dict.get('neglogpacs_fix')
-
+        self._extend_dataset(dataset_dict, batch_dict)
         self.dataset.update_values_dict(dataset_dict)
 
         if self.has_central_value:
@@ -1600,7 +1536,7 @@ class ContinuousA2CBase(A2CBase):
 
         while True:
             epoch_num = self.update_epoch()
-            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul, seqjepa_losses = self.train_epoch()
+            step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul = self.train_epoch()
             total_time += sum_time
             frame = self.frame // self.num_agents
 
@@ -1625,13 +1561,10 @@ class ContinuousA2CBase(A2CBase):
 
                 if len(b_losses) > 0:
                     self.writer.add_scalar('losses/bounds_loss', torch_ext.mean_list(b_losses).item(), frame)
-                if len(seqjepa_losses) > 0:
-                    self.writer.add_scalar('losses/seqjepa_aux_loss', torch_ext.mean_list(seqjepa_losses).item(), frame)
+                self._log_extra_losses(frame)
 
                 if self.has_soft_aug:
                     self.writer.add_scalar('losses/aug_loss', np.mean(aug_losses), frame)
-
-                latest_checkpoint_path = os.path.join(self.nn_dir, 'latest_' + self.config['name'])
 
                 if self.game_rewards.current_size > 0:
                     mean_rewards = self.game_rewards.get_mean()
@@ -1657,12 +1590,9 @@ class ContinuousA2CBase(A2CBase):
 
                     checkpoint_name = self.config['name'] + '_ep_' + str(epoch_num) + '_rew_' + str(mean_rewards[0])
 
-                    # Save checkpoint with fixed name for wandb upload (overwrites previous)
                     if self.save_freq > 0:
                         if epoch_num % self.save_freq == 0:
-                            print('saving most recent model')
-                            self.save(latest_checkpoint_path)
-                            self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
+                            self._save_checkpoint_at('periodic', epoch_num, checkpoint_name=checkpoint_name)
 
                     if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
                         print('saving next best rewards: ', mean_rewards)
@@ -1679,8 +1609,7 @@ class ContinuousA2CBase(A2CBase):
                         print('WARNING: Max epochs reached before any env terminated at least once')
                         mean_rewards = -np.inf
 
-                    self.save(latest_checkpoint_path)
-                    self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
+                    self._save_checkpoint_at('max_epochs', epoch_num, mean_rewards=mean_rewards)
                     print('MAX EPOCHS NUM!')
                     should_exit = True
 
@@ -1689,8 +1618,7 @@ class ContinuousA2CBase(A2CBase):
                         print('WARNING: Max frames reached before any env terminated at least once')
                         mean_rewards = -np.inf
 
-                    self.save(latest_checkpoint_path)
-                    self.algo_observer.on_checkpoint_saved(latest_checkpoint_path, epoch_num)
+                    self._save_checkpoint_at('max_frames', epoch_num, mean_rewards=mean_rewards)
                     print('MAX FRAMES NUM!')
                     should_exit = True
 

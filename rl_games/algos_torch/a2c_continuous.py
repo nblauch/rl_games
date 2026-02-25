@@ -55,9 +55,6 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.dataset = datasets.PPODataset(self.batch_size, self.minibatch_size, self.is_discrete, self.is_rnn, self.ppo_device, self.seq_length)
         if self.normalize_value:
             self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
-            # MORL: separate fixation value normalizer
-            if getattr(self, 'separate_fix_critic', False) and hasattr(self.model, 'value_mean_std_fix'):
-                self.value_mean_std_fix = self.model.value_mean_std_fix
 
         self.has_value_loss = self.use_experimental_cv or not self.has_central_value
         self.algo_observer.after_init(self)
@@ -76,6 +73,54 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
     def get_masked_action_values(self, obs, action_masks):
         assert False
+
+    def _compute_extra_loss(self, loss, res_dict, input_dict):
+        """Called after standard loss computation. Override to add extra loss terms. Must return extra loss to add."""
+        return 0
+
+    def _post_gradient_step(self, res_dict):
+        """Called after gradient step. Override for post-optimization updates."""
+        pass
+
+    def calc_losses(
+        self,
+        actor_loss_func,
+        old_action_log_probs_batch,
+        action_log_probs,
+        advantage,
+        curr_e_clip,
+        value_preds_batch,
+        values,
+        return_batch,
+        mu,
+        entropy,
+        rnn_masks,
+        res_dict=None,
+        input_dict=None,
+    ):
+        a_loss = actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
+        if self.has_value_loss:
+            c_loss = common_losses.critic_loss(
+                self.model,
+                value_preds_batch,
+                values,
+                curr_e_clip,
+                return_batch,
+                self.clip_value
+            )
+        else:
+            c_loss = torch.zeros(1, device=self.ppo_device)
+        if self.bound_loss_type == 'regularisation':
+            b_loss = self.reg_loss(mu)
+        elif self.bound_loss_type == 'bound':
+            b_loss = self.bound_loss(mu)
+        else:
+            b_loss = torch.zeros(1, device=self.ppo_device)
+
+        losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss, entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
+        a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
+        loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
+        return loss, a_loss, c_loss, entropy, b_loss, sum_mask
 
     def calc_gradients(self, input_dict):
         value_preds_batch = input_dict['old_values']
@@ -114,46 +159,24 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
             mu = res_dict['mus']
             sigma = res_dict['sigmas']
 
-            # MORL: separate actor losses for arm and fixation
-            if getattr(self, 'separate_fix_critic', False) and 'neglogpacs_arm' in res_dict:
-                advantage_fix = input_dict['advantages_fix']
-                old_logp_arm = input_dict['old_logp_actions_arm']
-                old_logp_fix = input_dict['old_logp_actions_fix']
-                new_logp_arm = res_dict['neglogpacs_arm']
-                new_logp_fix = res_dict['neglogpacs_fix']
-                a_loss_arm = self.actor_loss_func(old_logp_arm, new_logp_arm, advantage, self.ppo, curr_e_clip)
-                fix_advantage = advantage_fix if getattr(self, 'fix_critic_vision_only', False) else advantage + advantage_fix
-                a_loss_fix = self.actor_loss_func(old_logp_fix, new_logp_fix, fix_advantage, self.ppo, curr_e_clip)
-                a_loss = a_loss_arm + a_loss_fix
-            else:
-                a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
+            loss, a_loss, c_loss, entropy, b_loss, sum_mask = self.calc_losses(
+                self.actor_loss_func,
+                old_action_log_probs_batch,
+                action_log_probs,
+                advantage,
+                curr_e_clip,
+                value_preds_batch,
+                values,
+                return_batch,
+                mu,
+                entropy,
+                rnn_masks,
+                res_dict=res_dict,
+                input_dict=input_dict,
+            )
 
-            if self.has_value_loss:
-                c_loss = common_losses.critic_loss(self.model,value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
-                # MORL: add fixation critic loss
-                if getattr(self, 'separate_fix_critic', False) and 'values_fix' in res_dict:
-                    values_fix = res_dict['values_fix']
-                    return_fix = input_dict['returns_fix']
-                    old_values_fix = input_dict['old_values_fix']
-                    c_loss_fix = common_losses.critic_loss(self.model, old_values_fix, values_fix, curr_e_clip, return_fix, self.clip_value)
-                    c_loss = c_loss + c_loss_fix
-            else:
-                c_loss = torch.zeros(1, device=self.ppo_device)
-            if self.bound_loss_type == 'regularisation':
-                b_loss = self.reg_loss(mu)
-            elif self.bound_loss_type == 'bound':
-                b_loss = self.bound_loss(mu)
-            else:
-                b_loss = torch.zeros(1, device=self.ppo_device)
-            losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
-            a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
-
-            loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
-            seqjepa_loss = torch.zeros(1, device=self.ppo_device)
-            if getattr(self, 'seqjepa_enabled', False) and 'seqjepa_aux_loss' in res_dict:
-                seqjepa_loss = res_dict['seqjepa_aux_loss']
-                if getattr(self, 'seqjepa_aux_lambda', 0.0) != 0:
-                    loss = loss + self.seqjepa_aux_lambda * seqjepa_loss
+            extra_loss = self._compute_extra_loss(loss, res_dict, input_dict)
+            loss = loss + extra_loss
 
             if self.multi_gpu:
                 self.optimizer.zero_grad()
@@ -164,9 +187,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         self.scaler.scale(loss).backward()
         #TODO: Refactor this ugliest code of they year
         self.trancate_gradients_and_step()
-        if getattr(self, 'seqjepa_enabled', False) and hasattr(self.model, 'a2c_network') and hasattr(self.model.a2c_network, 'update_target_encoder'):
-            tau = getattr(self, 'seqjepa_ema_tau', 0.99)
-            self.model.a2c_network.update_target_encoder(tau)
+        self._post_gradient_step(res_dict)
 
         with torch.no_grad():
             reduce_kl = rnn_masks is None
@@ -185,7 +206,7 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
 
         self.train_result = (a_loss, c_loss, entropy, \
             kl_dist, self.last_lr, lr_mul, \
-            mu.detach(), sigma.detach(), b_loss, seqjepa_loss)
+            mu.detach(), sigma.detach(), b_loss)
 
     def train_actor_critic(self, input_dict):
         self.calc_gradients(input_dict)
@@ -207,5 +228,3 @@ class A2CAgent(a2c_common.ContinuousA2CBase):
         else:
             b_loss = 0
         return b_loss
-
-
