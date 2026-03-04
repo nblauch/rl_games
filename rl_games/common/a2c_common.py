@@ -1367,7 +1367,8 @@ class ContinuousA2CBase(A2CBase):
 
     def _on_dataset_prepared(self):
         """Called after prepare_dataset. Override for observer updates."""
-        self.algo_observer.update_buffer(self.experience_buffer)
+        if hasattr(self.algo_observer, 'update_buffer'):
+            self.algo_observer.update_buffer(self.experience_buffer)
 
     def _extend_dataset(self, dataset_dict, batch_dict):
         """Called before update_values_dict. Override to add entries to dataset_dict."""
